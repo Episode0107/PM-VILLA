@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>My Project — 3DM → GLB Converter</title>
+<style>
+  html,body{margin:0;height:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#16181d;color:#e8e9eb}
+  #drop{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;border:3px dashed #3a3f4a;margin:24px;border-radius:16px;transition:all .15s}
+  #drop.hover{border-color:#7aa2ff;background:#1b2130}
+  h1{font-size:20px;font-weight:600;margin:0}
+  p{margin:0;color:#9aa1ad;font-size:14px;max-width:520px;text-align:center;line-height:1.5}
+  #status{font-size:15px;font-weight:600;color:#7aa2ff;white-space:pre-wrap;text-align:center;max-width:640px}
+  #log{position:fixed;left:24px;bottom:24px;right:24px;max-height:30vh;overflow:auto;font:11px/1.5 ui-monospace,monospace;color:#6f7682;margin:0}
+  button,label.btn{background:#2d6cdf;color:#fff;border:0;border-radius:8px;padding:10px 22px;font-size:14px;font-weight:600;cursor:pointer}
+  input[type=file]{display:none}
+  #bar{width:320px;height:6px;background:#262a33;border-radius:3px;overflow:hidden;display:none}
+  #fill{height:100%;width:0%;background:#7aa2ff;transition:width .2s}
+</style>
+</head>
+<body>
+<div id="drop">
+  <h1 id="h1">My Project — Rhino → Web Converter</h1>
+  <p>Drag &amp; drop your <b>.3dm</b> file anywhere on this page (or click below).
+     It is converted locally in your browser — nothing is uploaded to a server.
+     The compressed model file downloads automatically when done.</p>
+  <label class="btn">Choose .3dm file<input type="file" id="file" accept=".3dm"></label>
+  <div id="bar"><div id="fill"></div></div>
+  <div id="status">STATUS: BOOTING</div>
+  <button id="dl" style="display:none">Download model again</button>
+</div>
+<pre id="log"></pre>
+
+<script type="importmap">
+{"imports":{
+  "three":"https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js",
+  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.164.1/examples/jsm/"
+}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { Rhino3dmLoader } from 'three/addons/loaders/3DMLoader.js';
+import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js';
+import { MeshoptSimplifier } from 'https://cdn.jsdelivr.net/npm/meshoptimizer@0.22.0/meshopt_simplifier.module.js';
+
+/* ============================================================
+   CONFIG — keep these in sync with index.html
+   ============================================================ */
+const CONFIG = {
+  PROJECT_NAME: 'My Project',
+  OUTPUT_FILE:  'model.glb.gz'   // must match MODEL_FILE in index.html
+};
+document.getElementById('h1').textContent = CONFIG.PROJECT_NAME + ' — Rhino → Web Converter';
+document.title = CONFIG.PROJECT_NAME + ' — 3DM → GLB Converter';
+
+const statusEl = document.getElementById('status');
+const logEl = document.getElementById('log');
+const fill = document.getElementById('fill');
+const bar = document.getElementById('bar');
+let lastBlob = null;
+
+function log(m){ logEl.textContent += m + '\n'; logEl.scrollTop = logEl.scrollHeight; console.log('[CONV]', m); }
+function setStatus(m){ statusEl.textContent = 'STATUS: ' + m; log(m); }
+function fail(m, e){ setStatus('ERROR: ' + m + (e ? ' :: ' + (e.message || e) : '')); console.error(e); }
+const tick = () => new Promise(r => setTimeout(r, 30)); // let UI paint between heavy steps
+
+const drop = document.getElementById('drop');
+['dragover','dragenter'].forEach(ev => document.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('hover'); }));
+['dragleave','drop'].forEach(ev => document.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('hover'); }));
+document.addEventListener('drop', e => { const f = e.dataTransfer.files[0]; if (f) start(f); });
+document.getElementById('file').addEventListener('change', e => { const f = e.target.files[0]; if (f) start(f); });
+document.getElementById('dl').addEventListener('click', () => lastBlob && save(lastBlob));
+
+function save(blob){
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = CONFIG.OUTPUT_FILE;
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+function cleanMaterial(mt, cache){
+  const key = mt ? mt.uuid : 'none';
+  if (cache.has(key)) return cache.get(key);
+  const hasVC = !!(mt && mt.vertexColors);
+  const out = new THREE.MeshStandardMaterial({
+    color: (mt && mt.color) ? mt.color.clone() : new THREE.Color(0xcccccc),
+    roughness: (mt && typeof mt.roughness === 'number') ? mt.roughness : 0.8,
+    metalness: (mt && typeof mt.metalness === 'number') ? mt.metalness : 0.0,
+    side: THREE.DoubleSide,
+    vertexColors: hasVC
+  });
+  if (mt && mt.transparent && mt.opacity < 1) { out.transparent = true; out.opacity = mt.opacity; }
+  if (mt && mt.name) out.name = mt.name;
+  cache.set(key, out);
+  return out;
+}
+
+// rebuild geometry keeping only vertices referenced by newIndex
+function compact(geom, newIndex){
+  const remap = new Map(); const order = [];
+  const ni = new Uint32Array(newIndex.length);
+  for (let i = 0; i < newIndex.length; i++) {
+    const v = newIndex[i];
+    let r = remap.get(v);
+    if (r === undefined) { r = order.length; remap.set(v, r); order.push(v); }
+    ni[i] = r;
+  }
+  const g2 = new THREE.BufferGeometry();
+  for (const name of Object.keys(geom.attributes)) {
+    const attr = geom.attributes[name];
+    const item = attr.itemSize, src = attr.array;
+    const dst = new src.constructor(order.length * item);
+    for (let j = 0; j < order.length; j++)
+      for (let k = 0; k < item; k++) dst[j*item+k] = src[order[j]*item+k];
+    g2.setAttribute(name, new THREE.BufferAttribute(dst, item, attr.normalized));
+  }
+  g2.setIndex(new THREE.BufferAttribute(ni, 1));
+  return g2;
+}
+
+let busy = false;
+async function start(file){
+  if (busy) { log('ignored extra drop — already converting'); return; }
+  busy = true;
+  try {
+    setStatus('PHASE:READ — reading ' + file.name + ' (' + (file.size/1048576).toFixed(1) + ' MB)');
+    bar.style.display = 'block';
+    const buf = await new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onprogress = e => { if (e.total) fill.style.width = (e.loaded/e.total*100).toFixed(0) + '%'; };
+      r.onload = () => res(r.result);
+      r.onerror = () => rej(r.error);
+      r.readAsArrayBuffer(file);
+    });
+
+    setStatus('PHASE:PARSE — parsing Rhino file (this can take a minute)…');
+    const loader = new Rhino3dmLoader();
+    loader.setLibraryPath('https://cdn.jsdelivr.net/npm/rhino3dm@8.9.0/');
+    const object = await new Promise((res, rej) => loader.parse(buf, res, rej));
+
+    const meshes = [];
+    object.updateMatrixWorld(true);
+    object.traverse(o => {
+      if (!o.isMesh || !o.visible || !o.geometry) return;
+      const g = o.geometry;
+      const count = g.index ? g.index.count : (g.attributes.position ? g.attributes.position.count : 0);
+      if (count >= 3) meshes.push(o);
+    });
+    if (meshes.length === 0) {
+      fail('NO RENDER MESHES found — re-save the file in Rhino with render meshes (shade a viewport first, do not use "save small"), then retry.');
+      return;
+    }
+
+    await MeshoptSimplifier.ready;
+    const matCache = new Map();
+    let trisBefore = 0, trisAfter = 0;
+    const group = new THREE.Group();
+
+    // total triangles for global ratio
+    for (const m of meshes) {
+      const g = m.geometry;
+      trisBefore += (g.index ? g.index.count : g.attributes.position.count) / 3;
+    }
+    const TARGET = 700000;
+    const ratio = Math.min(1, TARGET / trisBefore);
+    setStatus('PHASE:SIMPLIFY — ' + meshes.length + ' meshes, ' + Math.round(trisBefore).toLocaleString() + ' triangles → target ratio ' + ratio.toFixed(3));
+    await tick();
+
+    let mi = 0;
+    for (const m of meshes) {
+      mi++;
+      let g = m.geometry;
+      const mat = cleanMaterial(Array.isArray(m.material) ? m.material[0] : m.material, matCache);
+      // keep only position/normal(/color when used)
+      for (const name of Object.keys(g.attributes)) {
+        if (name === 'position' || name === 'normal') continue;
+        if (name === 'color' && mat.vertexColors) continue;
+        g.deleteAttribute(name);
+      }
+      if (!g.attributes.normal) g.computeVertexNormals();
+      g.clearGroups();
+      // weld duplicate vertices (identical attributes), keeps hard edges
+      g = BufferGeometryUtils.mergeVertices(g);
+      if (!g.index) g = g.toNonIndexed ? g : g; // mergeVertices always returns indexed
+      let indexArr = g.index.array instanceof Uint32Array ? g.index.array : new Uint32Array(g.index.array);
+
+      if (ratio < 1 && indexArr.length > 1500) {
+        const targetIdx = Math.min(indexArr.length, Math.max(384, Math.floor(indexArr.length * ratio / 3) * 3));
+        const pos = g.attributes.position.array;
+        const [simplified, err] = MeshoptSimplifier.simplify(indexArr, pos, 3, targetIdx, 0.01, []);
+        log('mesh ' + mi + '/' + meshes.length + ': ' + (indexArr.length/3).toLocaleString() + ' → ' + (simplified.length/3).toLocaleString() + ' tris (err ' + err.toFixed(4) + ')');
+        indexArr = simplified;
+      }
+      const cg = compact(g, indexArr);
+      trisAfter += indexArr.length / 3;
+      const clone = new THREE.Mesh(cg, mat);
+      clone.applyMatrix4(m.matrixWorld);
+      group.add(clone);
+      setStatus('PHASE:SIMPLIFY — mesh ' + mi + '/' + meshes.length + ' done');
+      await tick();
+    }
+
+    setStatus('PHASE:EXPORT — ' + Math.round(trisAfter).toLocaleString() + ' triangles. Exporting GLB…');
+    await tick();
+
+    // Z-up (Rhino) -> Y-up (glTF)
+    const root = new THREE.Group();
+    root.rotation.x = -Math.PI / 2;
+    root.add(group);
+    const scene = new THREE.Scene();
+    scene.add(root);
+
+    const glb = await new Promise((res, rej) =>
+      new GLTFExporter().parse(scene, res, rej, { binary: true, onlyVisible: true }));
+    setStatus('PHASE:GZIP — raw GLB ' + (glb.byteLength/1048576).toFixed(1) + ' MB, compressing…');
+    await tick();
+
+    const gzStream = new Blob([glb]).stream().pipeThrough(new CompressionStream('gzip'));
+    const gz = await new Response(gzStream).arrayBuffer();
+
+    lastBlob = new Blob([gz], { type: 'application/gzip' });
+    save(lastBlob);
+    document.getElementById('dl').style.display = 'inline-block';
+    bar.style.display = 'none';
+    setStatus('DONE — ' + CONFIG.OUTPUT_FILE + ' (' + (gz.byteLength/1048576).toFixed(2) + ' MB) saved to your Downloads. ' +
+      Math.round(trisBefore).toLocaleString() + ' → ' + Math.round(trisAfter).toLocaleString() + ' triangles, raw GLB ' + (glb.byteLength/1048576).toFixed(1) + ' MB.');
+  } catch (e) {
+    fail('conversion failed', e);
+  } finally {
+    busy = false;
+  }
+}
+setStatus('READY v4 — waiting for file');
+</script>
+</body>
+</html>

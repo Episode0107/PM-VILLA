@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- ┌─────────────────────────────────────────────────────────────┐
+     │  EDIT THESE TWO LINES TO REBRAND FOR YOUR PROJECT           │
+     │  PROJECT_NAME  – shown in title / loading screen           │
+     │  MODEL_FILE    – the gzipped GLB sitting next to this file  │
+     └─────────────────────────────────────────────────────────────┘ -->
+<title>My Project — 3D Model</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden}
+  body{background:linear-gradient(180deg,#f6f6f4 0%,#e9eaec 100%);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+  #app{position:fixed;inset:0}
+  canvas{display:block;outline:none}
+  #overlay{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:linear-gradient(180deg,#f6f6f4,#e9eaec);transition:opacity .5s;z-index:5}
+  #overlay.hide{opacity:0;pointer-events:none}
+  #overlay h1{font-size:15px;font-weight:600;color:#5a5f66;letter-spacing:.08em;text-transform:uppercase;margin:0}
+  #pbar{width:220px;height:3px;background:#d3d5d9;border-radius:2px;overflow:hidden}
+  #pfill{height:100%;width:0%;background:#5a5f66;transition:width .15s}
+  #ptext{font-size:12px;color:#9aa0a8}
+  #hint{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);font-size:12px;color:#8b9098;background:rgba(255,255,255,.7);backdrop-filter:blur(6px);padding:7px 14px;border-radius:999px;transition:opacity 1s;z-index:4;white-space:nowrap}
+  #hint.hide{opacity:0}
+  #title{position:fixed;left:18px;top:16px;font-size:13px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:#5a5f66;z-index:4}
+  #fs{position:fixed;right:14px;top:14px;width:34px;height:34px;border:0;border-radius:8px;background:rgba(255,255,255,.75);backdrop-filter:blur(6px);color:#5a5f66;cursor:pointer;z-index:4;font-size:15px;line-height:1}
+  #fs:hover{background:#fff}
+  #err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;color:#a33;font-size:14px;text-align:center;padding:20px;z-index:6}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="title">My Project</div>
+<button id="fs" title="Fullscreen">⛶</button>
+<div id="overlay">
+  <h1>My Project</h1>
+  <div id="pbar"><div id="pfill"></div></div>
+  <div id="ptext">Loading 3D model…</div>
+</div>
+<div id="hint">drag to orbit · scroll to zoom · right-drag to pan</div>
+<div id="err"></div>
+
+<script type="importmap">
+{"imports":{
+  "three":"https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js",
+  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.164.1/examples/jsm/"
+}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+/* ============================================================
+   CONFIG — change these two values for your project, that's it.
+   ============================================================ */
+const CONFIG = {
+  PROJECT_NAME: 'My Project',     // appears in the title + loading overlay
+  MODEL_FILE:   'model.glb.gz'    // gzipped GLB placed next to this file
+};
+
+// apply the project name to the page text
+document.getElementById('title').textContent = CONFIG.PROJECT_NAME;
+document.querySelector('#overlay h1').textContent = CONFIG.PROJECT_NAME;
+document.title = CONFIG.PROJECT_NAME + ' — 3D Model';
+
+const app = document.getElementById('app');
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+app.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.04).texture;
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.1, 5000);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+
+const hemi = new THREE.HemisphereLight(0xffffff, 0xb8bcc4, 0.5);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xfff4e0, 1.1);
+sun.position.set(1, 1.6, 0.8);
+scene.add(sun);
+
+function showError(msg){
+  const e = document.getElementById('err');
+  e.style.display = 'flex';
+  e.textContent = msg;
+  document.getElementById('overlay').classList.add('hide');
+}
+
+async function loadModel(){
+  const resp = await fetch('./' + CONFIG.MODEL_FILE);
+  if (!resp.ok) throw new Error('HTTP ' + resp.status);
+  const total = +resp.headers.get('content-length') || 0;
+  const reader = resp.body.getReader();
+  const chunks = [];
+  let loaded = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    loaded += value.byteLength;
+    if (total) {
+      const p = loaded / total * 100;
+      document.getElementById('pfill').style.width = p.toFixed(0) + '%';
+      document.getElementById('ptext').textContent = 'Loading 3D model… ' + p.toFixed(0) + '%';
+    }
+  }
+  document.getElementById('ptext').textContent = 'Preparing scene…';
+  const ds = new Blob(chunks).stream().pipeThrough(new DecompressionStream('gzip'));
+  const buf = await new Response(ds).arrayBuffer();
+  return new Promise((res, rej) => new GLTFLoader().parse(buf, '', res, rej));
+}
+
+loadModel().then(
+  gltf => {
+    const model = gltf.scene;
+
+    // Rhino vertex colors are sRGB; glTF expects linear — convert so colors aren't washed out
+    model.traverse(o => {
+      if (o.isMesh && o.geometry && o.geometry.attributes.color) {
+        const a = o.geometry.attributes.color;
+        const c = new THREE.Color();
+        for (let i = 0; i < a.count; i++) {
+          c.setRGB(a.getX(i), a.getY(i), a.getZ(i)).convertSRGBToLinear();
+          a.setXYZ(i, c.r, c.g, c.b);
+        }
+        a.needsUpdate = true;
+      }
+    });
+    scene.add(model);
+
+    // frame the camera on the main content (mesh with most triangles), not oversized base planes
+    let main = null, mainTris = 0;
+    model.traverse(o => {
+      if (o.isMesh && o.geometry) {
+        const t = (o.geometry.index ? o.geometry.index.count : o.geometry.attributes.position.count) / 3;
+        if (t > mainTris) { mainTris = t; main = o; }
+      }
+    });
+    const box = new THREE.Box3().setFromObject(main && mainTris > 1000 ? main : model);
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z);
+    const dist = maxDim / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2));
+    camera.near = maxDim / 1000;
+    camera.far = maxDim * 20;
+    camera.position.set(center.x + dist * 0.9, center.y + dist * 0.45, center.z + dist * 0.9);
+    camera.updateProjectionMatrix();
+    controls.target.copy(center);
+    controls.maxDistance = dist * 4;
+    controls.update();
+
+    document.getElementById('overlay').classList.add('hide');
+    setTimeout(() => document.getElementById('hint').classList.add('hide'), 6000);
+  },
+  err => {
+    console.error(err);
+    showError('Could not load the 3D model.');
+  }
+);
+
+document.getElementById('fs').addEventListener('click', () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen();
+});
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+</script>
+</body>
+</html>
